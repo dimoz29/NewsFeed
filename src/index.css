@@ -6,3 +6,8 @@ html, body {
   margin: 0;
   padding: 0;
 }
+
+/* make sure images in cards don't overflow on tiny screens */
+img { max-width: 100%; display: block; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
