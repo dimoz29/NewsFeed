@@ -1,14 +1,16 @@
+// src/GreekNewsfeedApp.jsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, RefreshCw, Search, Globe, Filter, Moon, Sun, ExternalLink, Check, X, Newspaper } from "lucide-react";
 import { XMLParser } from "fast-xml-parser";
 
-/**
- * Greek Newsfeed App — updated:
- * - categories (topic filters)
- * - lazy thumbnails (extract og:image / feed enclosure / first image)
- * - mobile responsive layout
- * - uses Pages Function proxy at /api/proxy?url= (same-origin)
- */
+/*
+  Greek Newsfeed App — updated:
+  - categories (topic filters)
+  - lazy thumbnails (extract og:image / feed enclosure / first image)
+  - mobile responsive layout
+  - uses Pages Function proxy at /api/proxy?url= (same-origin)
+  - enforces same-origin proxy and clears any saved external proxy
+*/
 
 /* -------------------------
    Configure sources + categories
@@ -108,8 +110,6 @@ const timeAgo = (date) => {
 };
 
 const LS = {
-  getProxy() { return localStorage.getItem("grnews_proxy") || ""; },
-  setProxy(v) { localStorage.setItem("grnews_proxy", v); },
   getReadSet() {
     try { return new Set(JSON.parse(localStorage.getItem("grnews_read") || "[]")); } catch { return new Set(); }
   },
@@ -120,10 +120,14 @@ const LS = {
    Component
    ------------------------- */
 export default function GreekNewsfeedApp() {
-  // default proxy is same-origin Pages Function
+  // Enforce same-origin proxy. Do NOT allow user-visible external worker URLs.
   const defaultProxy = "/api/proxy?url=";
+  // Clear any previously saved external proxy to avoid leaking worker.dev in localStorage
+  useEffect(() => { try { localStorage.removeItem("grnews_proxy"); } catch (e) {} }, []);
+  // Always use the default proxy — ignore previously saved value.
+  const [proxy, setProxy] = useState(defaultProxy);
+
   const [dark, setDark] = useState(() => (localStorage.getItem("grnews_dark") || "true") === "true");
-  const [proxy, setProxy] = useState(() => LS.getProxy() || defaultProxy);
   const [query, setQuery] = useState("");
   const [selectedSites, setSelectedSites] = useState([]);
   const [selectedCategory, setSelectedCategory] = useState("All");
@@ -133,11 +137,9 @@ export default function GreekNewsfeedApp() {
   const [page, setPage] = useState(1);
   const [perPage] = useState(60);
   const readSetRef = useRef(LS.getReadSet());
-  // thumbnails cache: id -> url
   const thumbsRef = useRef(new Map());
 
   useEffect(() => { document.documentElement.classList.toggle("dark", dark); localStorage.setItem("grnews_dark", String(dark)); }, [dark]);
-  useEffect(() => { if (proxy) LS.setProxy(proxy); }, [proxy]);
 
   const visibleItems = useMemo(() => {
     const filtered = items.filter(it => {
@@ -154,11 +156,10 @@ export default function GreekNewsfeedApp() {
   };
 
   const fetchWithProxy = async (url) => {
-    const finalUrl = proxy ? `${proxy}${encodeURIComponent(url)}` : url;
+    const finalUrl = `${proxy}${encodeURIComponent(url)}`;
     const r = await fetch(finalUrl);
     if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
-    const text = await r.text();
-    return text;
+    return await r.text();
   };
 
   const parseRss = (xml, sourceDomain) => {
@@ -169,7 +170,6 @@ export default function GreekNewsfeedApp() {
         const ch = j.rss.channel;
         const arr = Array.isArray(ch.item) ? ch.item : ch.item ? [ch.item] : [];
         return arr.map((it) => {
-          // attempt to find thumbnail in the feed item
           const media = it["media:content"] || it["media:thumbnail"] || it.enclosure;
           let thumb = "";
           if (media) {
@@ -197,7 +197,6 @@ export default function GreekNewsfeedApp() {
             const alt = it.link.find((l) => l["@_rel"] === "alternate");
             link = alt?.["@_href"] || it.link[0]?.["@_href"] || "";
           } else if (it.link?.["@_href"]) { link = it.link["@_href"]; }
-          // check for media/content
           const media = it["media:content"] || it.content;
           let thumb = "";
           if (media && typeof media === "object" && media["@_url"]) thumb = media["@_url"];
@@ -260,19 +259,21 @@ export default function GreekNewsfeedApp() {
 
   /* -------------------------
      Thumbnail extraction
-     - If item.thumbnail exists use it
+     - If item.thumbnail exists and isn't a google redirect/thumb use it
      - Otherwise lazily fetch article HTML via proxy and parse og:image or first <img>
      ------------------------- */
   const fetchThumbnailFor = async (item) => {
     if (!item?.link) return;
     if (thumbsRef.current.has(item.id)) return; // cached
-    if (item.thumbnail) {
-      thumbsRef.current.set(item.id, item.thumbnail);
+    const gThumb = item.thumbnail || "";
+    const isGoogleThumb = gThumb.includes("news.google.com") || gThumb.includes("gstatic") || gThumb.includes("googleusercontent");
+    if (gThumb && !isGoogleThumb) {
+      thumbsRef.current.set(item.id, gThumb);
       return;
     }
+
     try {
       const html = await fetchWithProxy(item.link);
-      // parse HTML for og:image, twitter:image, link[rel=image_src], first <img>
       const parserDOM = new DOMParser();
       const doc = parserDOM.parseFromString(html, "text/html");
       const metaOg = doc.querySelector("meta[property='og:image']") || doc.querySelector("meta[name='og:image']");
@@ -289,7 +290,6 @@ export default function GreekNewsfeedApp() {
         const firstImg = doc.querySelector("img");
         url = firstImg?.getAttribute("src") || "";
       }
-      // normalize relative URL
       if (url && url.startsWith("//")) url = window.location.protocol + url;
       if (url && url.startsWith("/")) {
         try {
@@ -297,24 +297,22 @@ export default function GreekNewsfeedApp() {
           url = `${u.origin}${url}`;
         } catch {}
       }
-      // save if valid
-      if (url) thumbsRef.current.set(item.id, url);
+      const isGoogleImage = url.includes("news.google.com") || url.includes("gstatic") || url.includes("googleusercontent");
+      if (url && !isGoogleImage) thumbsRef.current.set(item.id, url);
       else thumbsRef.current.set(item.id, "");
     } catch (err) {
       thumbsRef.current.set(item.id, "");
     }
   };
 
-  // Load thumbnails for currently visible items (lazy)
+  // Load thumbnails for visible items (lazy)
   useEffect(() => {
     if (!visibleItems.length) return;
     visibleItems.slice(0, 30).forEach(it => {
       if (!thumbsRef.current.has(it.id)) {
-        // schedule but don't block rendering
         fetchThumbnailFor(it);
       }
     });
-    // force a re-render after small delay so newly fetched thumbs show up
     const t = setInterval(() => setItems(i => [...i]), 1000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -322,59 +320,75 @@ export default function GreekNewsfeedApp() {
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">
-      <header className="sticky top-0 z-20 backdrop-blur supports-[backdrop-filter]:bg-white/70 supports-[backdrop-filter]:dark:bg-zinc-900/60 border-b border-zinc-200 dark:border-zinc-800">
-        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-3">
-          <Newspaper className="w-6 h-6" />
-          <h1 className="font-semibold text-xl">Greek Newsfeed — 50+ Πηγές</h1>
-          <div className="ml-auto flex items-center gap-2">
-            <div className="relative">
-              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 opacity-60" />
-              <input
-                className="pl-9 pr-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 outline-none focus:ring-2 ring-zinc-300 dark:ring-zinc-700"
-                placeholder="Αναζήτηση τίτλου…"
-                value={query}
-                onChange={(e) => { setPage(1); setQuery(e.target.value); }}
-              />
+      {/* Modern hero/header */}
+      <header className="sticky top-0 z-30">
+        <div className="bg-gradient-to-r from-indigo-600 via-cyan-500 to-emerald-500 dark:from-slate-800 dark:via-slate-700 dark:to-slate-600">
+          <div className="max-w-7xl mx-auto px-4 py-6 flex items-center gap-4">
+            <div className="flex items-center gap-3">
+              <div className="w-11 h-11 bg-white/20 rounded-full flex items-center justify-center shadow-sm">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" className="text-white">
+                  <rect width="20" height="20" x="2" y="2" rx="4" fill="white" fillOpacity="0.12"></rect>
+                  <path d="M6 8h12M6 12h8M6 16h6" stroke="white" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </div>
+              <div>
+                <h1 className="text-white font-semibold text-lg md:text-2xl leading-tight">Greek Newsfeed</h1>
+                <p className="text-white/90 text-xs md:text-sm mt-0.5">50+ ελληνικές πηγές — σε μία σελίδα</p>
+              </div>
             </div>
-            <button onClick={() => setDark(d => !d)} className="p-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800">
-              {dark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
-            </button>
-            <button onClick={loadAll} disabled={loading} className="p-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50">
-              {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <RefreshCw className="w-5 h-5" />}
-            </button>
+
+            <div className="ml-auto flex items-center gap-2">
+              <div className="relative">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 opacity-80 text-white/90" />
+                <input
+                  className="pl-9 pr-3 py-2 rounded-xl bg-white/20 text-white placeholder-white/70 outline-none focus:ring-2 ring-white/30"
+                  placeholder="Αναζήτηση τίτλου…"
+                  value={query}
+                  onChange={(e) => { setPage(1); setQuery(e.target.value); }}
+                />
+              </div>
+
+              <button onClick={() => setDark(d => !d)} className="p-2 rounded-xl bg-white/10 text-white/90 hover:bg-white/20">
+                {dark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+              </button>
+
+              <button onClick={loadAll} disabled={loading} className="p-2 rounded-xl bg-white/10 text-white/90 hover:bg-white/20 disabled:opacity-50">
+                {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <RefreshCw className="w-5 h-5" />}
+              </button>
+            </div>
           </div>
         </div>
 
-        <div className="max-w-7xl mx-auto px-4 pb-3 flex items-center gap-2 flex-wrap">
-          <div className="flex items-center gap-2 text-sm opacity-80"><Filter className="w-4 h-4" /> Κατηγορίες:</div>
+        {/* Category row */}
+        <div className="bg-white dark:bg-zinc-900 border-b border-zinc-100 dark:border-zinc-800">
+          <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-2 overflow-x-auto no-scrollbar">
+            <div className="flex items-center gap-2 text-sm opacity-80"><Filter className="w-4 h-4" /> Κατηγορίες:</div>
 
-          <div className="flex gap-2 overflow-x-auto no-scrollbar py-1">
-            <button
-              onClick={() => { setSelectedCategory("All"); setPage(1); }}
-              className={`px-3 py-1.5 rounded-full border ${selectedCategory === "All" ? "bg-zinc-900 text-white dark:bg-white dark:text-zinc-900" : "bg-white dark:bg-zinc-800"} border-zinc-200 dark:border-zinc-700 whitespace-nowrap`}
-            >Όλα</button>
-
-            {CATEGORIES.map(cat => (
+            <div className="flex gap-2">
               <button
-                key={cat}
-                onClick={() => { setSelectedCategory(cat); setPage(1); }}
-                className={`px-3 py-1.5 rounded-full border ${selectedCategory === cat ? "bg-zinc-900 text-white dark:bg-white dark:text-zinc-900" : "bg-white dark:bg-zinc-800"} border-zinc-200 dark:border-zinc-700 whitespace-nowrap`}
-              >{cat}</button>
-            ))}
-          </div>
+                onClick={() => { setSelectedCategory("All"); setPage(1); }}
+                className={`px-3 py-1.5 rounded-full border ${selectedCategory === "All" ? "bg-zinc-900 text-white dark:bg-white dark:text-zinc-900" : "bg-white dark:bg-zinc-800"} border-zinc-200 dark:border-zinc-700 whitespace-nowrap`}
+              >Όλα</button>
 
-          <div className="ml-auto flex items-center gap-2">
-            <input
-              className="min-w-[240px] px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 outline-none focus:ring-2 ring-zinc-300 dark:ring-zinc-700"
-              placeholder="Proxy URL (π.χ. https://example.com/api/proxy?url=)"
-              value={proxy}
-              onChange={(e) => setProxy(e.target.value)}
-              onBlur={() => LS.setProxy(proxy)}
-            />
+              {CATEGORIES.map(cat => (
+                <button
+                  key={cat}
+                  onClick={() => { setSelectedCategory(cat); setPage(1); }}
+                  className={`px-3 py-1.5 rounded-full border ${selectedCategory === cat ? "bg-zinc-900 text-white dark:bg-white dark:text-zinc-900" : "bg-white dark:bg-zinc-800"} border-zinc-200 dark:border-zinc-700 whitespace-nowrap`}
+                >{cat}</button>
+              ))}
+            </div>
+
+            <div className="ml-auto flex items-center gap-2">
+              <span className="px-3 py-1 rounded-full text-xs bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700">
+                Proxy: <strong className="font-mono">/api/proxy</strong>
+              </span>
+            </div>
           </div>
         </div>
       </header>
 
+      {/* Content */}
       <main className="max-w-7xl mx-auto px-4 py-6">
         {error && (
           <div className="mb-4 p-3 rounded-xl bg-red-100 text-red-900 dark:bg-red-900/30 dark:text-red-200">
