@@ -1,28 +1,35 @@
 /**
+ * functions/api/proxy.js
+ *
  * Cloudflare Pages Function that proxies an external URL and returns the upstream body.
  * Usage: /api/proxy?url=<encoded-url>
  *
- * This hides your worker.dev external URL and gives the frontend a same-origin
- * proxy at /api/proxy. It also returns CORS header for browser requests.
+ * This hides external worker URLs and provides a same-origin proxy for the frontend.
  */
 export async function onRequest(context) {
   try {
     const url = new URL(context.request.url).searchParams.get("url");
     if (!url) return new Response("Missing url", { status: 400 });
 
-    // Fetch upstream (you can optionally add rate limiting / caching here)
+    // Basic validation — only allow http/https
+    if (!/^https?:\/\//i.test(url)) {
+      return new Response("Invalid URL", { status: 400 });
+    }
+
+    // Fetch upstream
     const resp = await fetch(url, {
-      headers: { "user-agent": "Mozilla/5.0 (compatible)" },
+      // Custom UA helps some sites return full HTML
+      headers: { "user-agent": "Mozilla/5.0 (compatible; NewsFeed/1.0; +https://example.com)" },
+      // follow redirects
+      redirect: "follow",
     });
 
+    // Copy headers, but ensure CORS and cache-control are set
     const headers = new Headers(resp.headers);
-    // Ensure we return CORS so the browser can read it
     headers.set("access-control-allow-origin", "*");
-    // Make sure content type is preserved
-    const contentType = headers.get("content-type") || "application/xml; charset=utf-8";
-    headers.set("content-type", contentType);
-    // Light cache to reduce repeated upstream calls
     headers.set("cache-control", "public, max-age=60");
+    // Keep content-type if available
+    if (!headers.get("content-type")) headers.set("content-type", "application/xml; charset=utf-8");
 
     return new Response(resp.body, { status: resp.status, headers });
   } catch (err) {
